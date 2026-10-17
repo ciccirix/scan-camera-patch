@@ -127,9 +127,19 @@ struct Cam { uint8_t mac[6]; char brand[12]; int8_t rssi; uint16_t hits;
              uint8_t ap[6]; uint8_t ch; bool haveAp; };
 static Cam c_list[CAM_MAX];
 static int c_count = 0;
+static bool camChans[16] = { false };   // channels where any camera was seen (for AP hunting)
+
+// learn a camera's AP from a frame whose DESTINATION is that camera (AP -> cam downlink)
+static void recordAp(const uint8_t* mac, const uint8_t* ap, uint8_t ch) {
+  for (int i = 0; i < c_count; i++)
+    if (!c_list[i].haveAp && memcmp(c_list[i].mac, mac, 6) == 0) {
+      memcpy(c_list[i].ap, ap, 6); c_list[i].ch = ch; c_list[i].haveAp = true; return;
+    }
+}
 
 static void addCam(const uint8_t* mac, int8_t rssi, const char* brand, const uint8_t* ap, uint8_t ch) {
   cam_activity = true;
+  if (ch >= 1 && ch <= 13) camChans[ch] = true;
   for (int i = 0; i < c_count; i++) {
     if (memcmp(c_list[i].mac, mac, 6) == 0) {
       c_list[i].rssi = rssi; c_list[i].hits++;
@@ -168,6 +178,10 @@ static void cam_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
     const uint8_t* ap = NULL;
     if (type == WIFI_PKT_DATA && (fr[1] & 0x01)) ap = &fr[4];  // to-DS: addr1 = BSSID (AP)
     addCam(mac, p->rx_ctrl.rssi, brand, ap, cam_cur_ch);
+  }
+  // also learn the AP from AP -> camera downlink (from-DS): addr1 = dest (camera), addr2 = BSSID
+  if (c_count > 0 && type == WIFI_PKT_DATA && (fr[1] & 0x02) && !(fr[1] & 0x01) && len >= 16) {
+    recordAp(&fr[4], &fr[10], cam_cur_ch);
   }
 }
 
@@ -286,15 +300,37 @@ static void header(const char* title, uint16_t col, const char* l1, const char* 
   if (l2) display_obj.tft.println(l2);
 }
 
-// one sweep step with adaptive parking; returns true if exit requested
+static int g_huntCh = 1;
+static int g_stepCtr = 0;
+static void sweepReset() { memset(camChans, 0, sizeof(camChans)); g_huntCh = 1; g_stepCtr = 0; }
+
+// one sweep step; returns true if exit requested.
+// If a camera still lacks its AP, 3 of every 4 steps PARK ~1.4 s on a channel
+// where a camera was seen, hunting for its data frame; the 4th step keeps the
+// weighted sweep going so new cameras are still found.
 static bool sweepStep(int& si, bool withApCol) {
+  bool needAp = (c_count > 0 && countWithAp() < c_count);
+  if (needAp && (g_stepCtr++ % 4) != 3) {
+    uint8_t ch = 0;
+    for (int t = 0; t < 13; t++) {
+      int c = ((g_huntCh - 1 + t) % 13) + 1;
+      if (camChans[c]) { ch = c; g_huntCh = (c % 13) + 1; break; }
+    }
+    if (ch) {
+      cam_cur_ch = ch;
+      esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+      cam_activity = false;
+      if (dwell(1400)) return true;        // long park: catch cam -> AP data for the BSSID
+      drawList(withApCol);
+      return false;
+    }
+  }
   cam_cur_ch = SWEEP[si % SWEEP_N]; si++;
   esp_wifi_set_channel(cam_cur_ch, WIFI_SECOND_CHAN_NONE);
   cam_activity = false;
   bool prime = (cam_cur_ch == 1 || cam_cur_ch == 6 || cam_cur_ch == 11);
   if (dwell(prime ? 280 : 200)) return true;
-  // adaptive park: saw a camera here but still missing its AP -> linger for its data frame
-  if (cam_activity && countWithAp() < c_count) { if (dwell(320)) return true; }
+  if (cam_activity && needAp) { if (dwell(400)) return true; }
   drawList(withApCol);
   return false;
 }
@@ -302,6 +338,7 @@ static bool sweepStep(int& si, bool withApCol) {
 // ─────────────────────────── Passive scan ───────────────────────────
 void CameraScan::run() {
   c_count = 0;
+  sweepReset();
   header("Camera Scan", TFT_CYAN, "Wi-Fi cameras (passive)...",
          "RSSI high = closer.  Exit to quit");
   delay(600);
@@ -315,6 +352,7 @@ void CameraScan::run() {
 // ─────────────────────────── Detect + deauth ───────────────────────────
 void CameraScan::runDeauth() {
   c_count = 0;
+  sweepReset();
   header("Camera Deauth", TFT_RED, "1) finding cameras...",
          "Exit when they show [AP]");
   delay(600);
